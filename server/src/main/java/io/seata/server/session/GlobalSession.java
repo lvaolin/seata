@@ -25,6 +25,7 @@ import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantLock;
 
 import io.seata.common.XID;
+import io.seata.core.exception.GlobalTransactionException;
 import io.seata.core.exception.TransactionException;
 import io.seata.core.exception.TransactionExceptionCode;
 import io.seata.core.model.BranchStatus;
@@ -113,12 +114,32 @@ public class GlobalSession implements SessionLifecycle, SessionStorable {
     }
 
     /**
+     * Is saga type transaction
+     *
+     * @return is saga
+     */
+    public boolean isSaga() {
+        if (branchSessions.size() > 0) {
+            return BranchType.SAGA == branchSessions.get(0).getBranchType();
+        }
+        return false;
+    }
+
+    /**
      * Is timeout boolean.
      *
      * @return the boolean
      */
     public boolean isTimeout() {
         return (System.currentTimeMillis() - beginTime) > timeout;
+    }
+
+    /**
+     * prevent could not handle rollbacking transaction
+     * @return if true force roll back
+     */
+    public boolean isRollbackingDead() {
+        return (System.currentTimeMillis() - beginTime) > (2 * 6000);
     }
 
     @Override
@@ -251,8 +272,7 @@ public class GlobalSession implements SessionLifecycle, SessionStorable {
      * @return the sorted branches
      */
     public ArrayList<BranchSession> getSortedBranches() {
-        ArrayList<BranchSession> sorted = new ArrayList<>(branchSessions);
-        return sorted;
+        return new ArrayList<>(branchSessions);
     }
 
     /**
@@ -581,7 +601,7 @@ public class GlobalSession implements SessionLifecycle, SessionStorable {
         globalSessionLock.unlock();
     }
 
-    public void lockAndExcute(LockRunnable excuteRunnable) throws TransactionException {
+    public void lockAndExecute(LockRunnable excuteRunnable) throws TransactionException {
         this.lock();
         try {
             excuteRunnable.run();
@@ -590,7 +610,7 @@ public class GlobalSession implements SessionLifecycle, SessionStorable {
         }
     }
 
-    public <T> T lockAndExcute(LockCallable<T> lockCallable) throws TransactionException {
+    public <T> T lockAndExecute(LockCallable<T> lockCallable) throws TransactionException {
         this.lock();
         try {
             return lockCallable.call();
@@ -599,7 +619,7 @@ public class GlobalSession implements SessionLifecycle, SessionStorable {
         }
     }
 
-    private class GlobalSessionLock {
+    private static class GlobalSessionLock {
 
         private Lock globalSessionLock = new ReentrantLock();
 
@@ -613,7 +633,7 @@ public class GlobalSession implements SessionLifecycle, SessionStorable {
             } catch (InterruptedException e) {
                 LOGGER.error("Interrupted error", e);
             }
-            throw new TransactionException(TransactionExceptionCode.FailedLockGlobalTranscation);
+            throw new GlobalTransactionException(TransactionExceptionCode.FailedLockGlobalTranscation, "Lock global session failed");
         }
 
         public void unlock() {
@@ -636,5 +656,28 @@ public class GlobalSession implements SessionLifecycle, SessionStorable {
 
     public ArrayList<BranchSession> getBranchSessions() {
         return branchSessions;
+    }
+
+    public void asyncCommit() throws TransactionException {
+        this.addSessionLifecycleListener(SessionHolder.getAsyncCommittingSessionManager());
+        SessionHolder.getAsyncCommittingSessionManager().addGlobalSession(this);
+        this.changeStatus(GlobalStatus.AsyncCommitting);
+    }
+
+    public void queueToRetryCommit() throws TransactionException {
+        this.addSessionLifecycleListener(SessionHolder.getRetryCommittingSessionManager());
+        SessionHolder.getRetryCommittingSessionManager().addGlobalSession(this);
+        this.changeStatus(GlobalStatus.CommitRetrying);
+    }
+
+    public void queueToRetryRollback() throws TransactionException {
+        this.addSessionLifecycleListener(SessionHolder.getRetryRollbackingSessionManager());
+        SessionHolder.getRetryRollbackingSessionManager().addGlobalSession(this);
+        GlobalStatus currentStatus = this.getStatus();
+        if (SessionHelper.isTimeoutGlobalStatus(currentStatus)) {
+            this.changeStatus(GlobalStatus.TimeoutRollbackRetrying);
+        } else {
+            this.changeStatus(GlobalStatus.RollbackRetrying);
+        }
     }
 }
